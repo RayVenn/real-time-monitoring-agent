@@ -19,7 +19,7 @@ mod kafka;
 use anyhow::{Context, Result};
 use clap::Parser;
 use log::{info, warn};
-use monitor_common::NetworkEvent;
+use monitor_common::{NetworkEvent, RetransmitEvent};
 use pnet::datalink;
 use pnet::packet::{
     ethernet::{EthernetPacket, EtherTypes},
@@ -32,6 +32,12 @@ use std::{collections::HashMap, net::{IpAddr, Ipv4Addr}};
 use tokio::sync::mpsc;
 
 use kafka::KafkaProducer;
+
+// Events sent from the capture thread to the async Kafka sender.
+enum CaptureEvent {
+    Rtt(NetworkEvent),
+    Retransmit(RetransmitEvent),
+}
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 
@@ -54,6 +60,10 @@ struct Args {
     #[arg(short = 't', long, default_value = "net-latency")]
     kafka_topic: String,
 
+    /// Kafka topic to produce retransmission events to
+    #[arg(short = 'r', long, default_value = "net-retransmit")]
+    retransmit_topic: String,
+
     /// Log verbosity level: error | warn | info | debug | trace
     #[arg(short, long, default_value = "info")]
     log_level: String,
@@ -71,11 +81,12 @@ async fn main() -> Result<()> {
     .init();
 
     info!("Network latency monitor starting up (pcap mode)");
-    info!("Interface    : {}", args.interface);
-    info!("Kafka brokers: {}", args.kafka_brokers);
-    info!("Kafka topic  : {}", args.kafka_topic);
+    info!("Interface        : {}", args.interface);
+    info!("Kafka brokers    : {}", args.kafka_brokers);
+    info!("RTT topic        : {}", args.kafka_topic);
+    info!("Retransmit topic : {}", args.retransmit_topic);
 
-    let kafka = KafkaProducer::new(&args.kafka_brokers, &args.kafka_topic)
+    let kafka = KafkaProducer::new(&args.kafka_brokers, &args.kafka_topic, &args.retransmit_topic)
         .context("Failed to create Kafka producer")?;
 
     // ── Channel: capture thread → async Kafka sender ─────────────────────────
@@ -83,7 +94,7 @@ async fn main() -> Result<()> {
     // `mpsc` = multi-producer, single-consumer channel.
     // Capacity 1024: if Kafka is slow, we buffer up to 1024 events in memory
     // before the capture thread blocks on `blocking_send`.
-    let (tx, mut rx) = mpsc::channel::<NetworkEvent>(1024);
+    let (tx, mut rx) = mpsc::channel::<CaptureEvent>(1024);
 
     // ── Resolve local IP of the capture interface ────────────────────────────
     //
@@ -133,7 +144,11 @@ async fn main() -> Result<()> {
             // Drain the channel. `rx.recv()` returns None when all senders
             // (the capture thread) have been dropped — i.e., on shutdown.
             while let Some(event) = rx.recv().await {
-                if let Err(e) = kafka.send_event(&event).await {
+                let result = match event {
+                    CaptureEvent::Rtt(e)         => kafka.send_event(&e).await,
+                    CaptureEvent::Retransmit(e)  => kafka.send_retransmit(&e).await,
+                };
+                if let Err(e) = result {
                     warn!("Failed to send event to Kafka: {e}");
                 }
             }
@@ -174,7 +189,7 @@ fn tcp_payload_len(ipv4: &Ipv4Packet, tcp: &TcpPacket) -> u32 {
 ///
 /// For each outgoing packet (SYN or DATA), records the timestamp.
 /// When the remote sends an ACK back, computes RTT and emits a `NetworkEvent`.
-fn capture_loop(interface: &str, local_ip: Option<u32>, tx: mpsc::Sender<NetworkEvent>) -> Result<()> {
+fn capture_loop(interface: &str, local_ip: Option<u32>, tx: mpsc::Sender<CaptureEvent>) -> Result<()> {
     let mut cap = pcap::Capture::from_device(interface)
         .context("Network interface not found — check `--interface`")?
         .promisc(true)
@@ -192,7 +207,12 @@ fn capture_loop(interface: &str, local_ip: Option<u32>, tx: mpsc::Sender<Network
     //
     // SeqKey = (src_ip, src_port, dst_ip, dst_port, next_seq)
     // where next_seq = seq + payload_len (the ACK number we expect back).
-    let mut pending_seqs: HashMap<SeqKey, u64> = HashMap::new();
+    // value = (capture timestamp µs, TCP payload bytes)
+    let mut pending_seqs: HashMap<SeqKey, (u64, u32)> = HashMap::new();
+
+    // Retransmission counters: how many times each seq has been retransmitted.
+    let mut seq_retransmit_counts:  HashMap<SeqKey,    u32> = HashMap::new();
+    let mut syn_retransmit_counts:  HashMap<ConnKey,   u32> = HashMap::new();
 
     let mut event_count: u64 = 0;
 
@@ -237,20 +257,40 @@ fn capture_loop(interface: &str, local_ip: Option<u32>, tx: mpsc::Sender<Network
         // the remote sends the SYN-ACK back.
         if is_syn && !is_ack {
             if local_ip.map_or(true, |lip| src_addr == lip) {
-                pending_syns.insert((src_addr, src_port, dst_addr, dst_port), ts_us);
+                let syn_key = (src_addr, src_port, dst_addr, dst_port);
+                if let Some(original_ts) = pending_syns.insert(syn_key, ts_us) {
+                    // Key already existed → SYN retransmit (no SYN-ACK received yet)
+                    let count = syn_retransmit_counts.entry(syn_key).or_insert(0);
+                    *count += 1;
+                    let event = RetransmitEvent {
+                        src_addr,
+                        dst_addr,
+                        src_port,
+                        dst_port,
+                        rto_us:           ts_us.saturating_sub(original_ts) as u32,
+                        retransmit_count: *count,
+                        timestamp_ns,
+                    };
+                    info!("retransmit SYN {}:{} → {}:{} rto={}µs count={}",
+                        Ipv4Addr::from(src_addr), src_port,
+                        Ipv4Addr::from(dst_addr), dst_port,
+                        event.rto_us, event.retransmit_count);
+                    let _ = tx.blocking_send(CaptureEvent::Retransmit(event));
+                }
             }
             continue;
         }
 
         // ── Compute RTT ───────────────────────────────────────────────────────
-        let rtt_us: u32 = if is_syn && is_ack {
+        let (rtt_us, payload_bytes): (u32, u32) = if is_syn && is_ack {
             // SYN-ACK from remote: measures TCP handshake RTT.
             // SYN-ACK reverses src/dst vs. the SYN, so look up with reversed key.
             let syn_key = (dst_addr, dst_port, src_addr, src_port);
-            pending_syns
+            let rtt = pending_syns
                 .remove(&syn_key)
                 .map(|syn_ts| ts_us.saturating_sub(syn_ts) as u32)
-                .unwrap_or(0)
+                .unwrap_or(0);
+            (rtt, 0) // handshake carries no payload
 
         } else if is_ack && !is_rst && local_ip.map_or(true, |lip| src_addr != lip) {
             // ACK from remote: measures round-trip time for our outgoing data.
@@ -260,14 +300,14 @@ fn capture_loop(interface: &str, local_ip: Option<u32>, tx: mpsc::Sender<Network
                            tcp.get_acknowledgement());
             pending_seqs
                 .remove(&seq_key)
-                .map(|data_ts| ts_us.saturating_sub(data_ts) as u32)
-                .unwrap_or(0)
+                .map(|(data_ts, plen)| (ts_us.saturating_sub(data_ts) as u32, plen))
+                .unwrap_or((0, 0))
 
         } else {
-            0
+            (0, 0)
         };
 
-        // ── Emit event if RTT was measured ────────────────────────────────────
+        // ── Emit RTT event if measured ────────────────────────────────────────
         if rtt_us > 0 {
             // The current packet is an ACK from remote (src=remote, dst=local).
             // Swap src/dst so the event always reads "local → remote".
@@ -276,19 +316,34 @@ fn capture_loop(interface: &str, local_ip: Option<u32>, tx: mpsc::Sender<Network
                 dst_addr: src_addr,  // remote IP
                 src_port: dst_port,  // local port
                 dst_port: src_port,  // remote port
+                payload_bytes,
                 rtt_us,
                 timestamp_ns,
             };
 
+            // ACK arrived — clear retransmit counter for this connection if any.
+            if is_syn {
+                // SYN-ACK: clear SYN retransmit counter
+                syn_retransmit_counts.remove(&(event.src_addr, event.src_port,
+                                               event.dst_addr, event.dst_port));
+            } else {
+                // Data ACK: clear seq retransmit counter
+                let seq_key = (event.src_addr, event.src_port,
+                               event.dst_addr, event.dst_port,
+                               tcp.get_acknowledgement());
+                seq_retransmit_counts.remove(&seq_key);
+            }
+
             info!(
-                "[{}] {}:{} → {}:{} | rtt={}µs",
+                "[{}] {}:{} → {}:{} | rtt={}µs bytes={}",
                 event_count,
                 Ipv4Addr::from(event.src_addr), event.src_port,
                 Ipv4Addr::from(event.dst_addr), event.dst_port,
                 rtt_us,
+                payload_bytes,
             );
 
-            if tx.blocking_send(event).is_err() {
+            if tx.blocking_send(CaptureEvent::Rtt(event)).is_err() {
                 break;
             }
 
@@ -314,7 +369,25 @@ fn capture_loop(interface: &str, local_ip: Option<u32>, tx: mpsc::Sender<Network
             if seq_advance > 0 {
                 let next_seq = tcp.get_sequence().wrapping_add(seq_advance);
                 let seq_key  = (src_addr, src_port, dst_addr, dst_port, next_seq);
-                pending_seqs.insert(seq_key, ts_us);
+                if let Some((original_ts, _)) = pending_seqs.insert(seq_key, (ts_us, payload_len)) {
+                    // Key already existed → DATA retransmit (no ACK received yet)
+                    let count = seq_retransmit_counts.entry(seq_key).or_insert(0);
+                    *count += 1;
+                    let event = RetransmitEvent {
+                        src_addr,
+                        dst_addr,
+                        src_port,
+                        dst_port,
+                        rto_us:           ts_us.saturating_sub(original_ts) as u32,
+                        retransmit_count: *count,
+                        timestamp_ns,
+                    };
+                    info!("retransmit DATA {}:{} → {}:{} rto={}µs count={}",
+                        Ipv4Addr::from(src_addr), src_port,
+                        Ipv4Addr::from(dst_addr), dst_port,
+                        event.rto_us, event.retransmit_count);
+                    let _ = tx.blocking_send(CaptureEvent::Retransmit(event));
+                }
             }
         }
 

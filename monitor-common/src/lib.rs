@@ -1,5 +1,22 @@
 //! Shared types between the capture agent and any downstream consumers.
 
+/// A TCP retransmission detected on an outgoing connection.
+#[derive(Clone, Copy, Debug)]
+pub struct RetransmitEvent {
+    /// Source IPv4 address (local machine) in network byte order.
+    pub src_addr: u32,
+    /// Destination IPv4 address (remote) in network byte order.
+    pub dst_addr: u32,
+    pub src_port: u16,
+    pub dst_port: u16,
+    /// Time since the original packet was sent (≈ RTO), in microseconds.
+    pub rto_us: u32,
+    /// How many times this sequence number has been retransmitted so far.
+    pub retransmit_count: u32,
+    /// Capture timestamp of this retransmit in nanoseconds.
+    pub timestamp_ns: u64,
+}
+
 /// A network event captured from a live TCP packet stream.
 ///
 /// # IP Address Byte Order
@@ -25,16 +42,13 @@ pub struct NetworkEvent {
     /// Destination TCP port.
     pub dst_port: u16,
 
-    /// Round-trip time in microseconds measured from TCP handshake timing.
-    ///
-    /// Computed as: `SYN-ACK capture timestamp − SYN capture timestamp`.
-    /// `0` for packets where RTT has not been measured (e.g., mid-connection
-    /// data packets).
+    /// TCP payload size in bytes of the data packet that triggered this RTT measurement.
+    /// `0` for handshake (SYN/SYN-ACK) RTT events which carry no payload.
+    pub payload_bytes: u32,
+
+    /// Round-trip time in microseconds.
     pub rtt_us: u32,
 
     /// Packet capture timestamp in nanoseconds (from the pcap packet header).
-    ///
-    /// This is wall-clock time (from the kernel's packet capture clock),
-    /// unlike the eBPF monotonic clock. Suitable for absolute timestamping.
     pub timestamp_ns: u64,
 }

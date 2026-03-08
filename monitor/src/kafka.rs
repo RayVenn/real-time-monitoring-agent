@@ -21,7 +21,7 @@
 //! ```
 
 use anyhow::{Context, Result};
-use monitor_common::NetworkEvent;
+use monitor_common::{NetworkEvent, RetransmitEvent};
 use rdkafka::{
     producer::{FutureProducer, FutureRecord},
     ClientConfig,
@@ -37,26 +37,26 @@ use std::{net::Ipv4Addr, time::Duration};
 /// downstream consumers don't need to handle byte-order conversion.
 #[derive(Serialize)]
 struct KafkaPayload<'a> {
-    src_ip:       &'a str,
-    src_port:     u16,
-    dst_ip:       &'a str,
-    dst_port:     u16,
-    /// Round-trip time in microseconds (0 = not measured for this packet)
-    rtt_us:       u32,
-    /// Wall-clock capture timestamp in nanoseconds
-    timestamp_ns: u64,
+    src_ip:        &'a str,
+    src_port:      u16,
+    dst_ip:        &'a str,
+    dst_port:      u16,
+    payload_bytes: u32,
+    rtt_us:        u32,
+    timestamp_ns:  u64,
 }
 
 // ─── Producer ─────────────────────────────────────────────────────────────────
 
 pub struct KafkaProducer {
-    producer: FutureProducer,
-    topic:    String,
+    producer:          FutureProducer,
+    topic:             String,
+    retransmit_topic:  String,
 }
 
 impl KafkaProducer {
     /// Create a new Kafka producer connected to the given brokers.
-    pub fn new(brokers: &str, topic: &str) -> Result<Self> {
+    pub fn new(brokers: &str, topic: &str, retransmit_topic: &str) -> Result<Self> {
         let producer: FutureProducer = ClientConfig::new()
             .set("bootstrap.servers", brokers)
             .set("message.timeout.ms", "5000")
@@ -69,6 +69,7 @@ impl KafkaProducer {
         Ok(Self {
             producer,
             topic: topic.to_string(),
+            retransmit_topic: retransmit_topic.to_string(),
         })
     }
 
@@ -83,18 +84,61 @@ impl KafkaProducer {
         let key = format!("{}:{}->{}", src_ip, event.src_port, dst_ip);
 
         let payload = serde_json::to_string(&KafkaPayload {
-            src_ip:       &src_ip,
-            src_port:     event.src_port,
-            dst_ip:       &dst_ip,
-            dst_port:     event.dst_port,
-            rtt_us:       event.rtt_us,
-            timestamp_ns: event.timestamp_ns,
+            src_ip:        &src_ip,
+            src_port:      event.src_port,
+            dst_ip:        &dst_ip,
+            dst_port:      event.dst_port,
+            payload_bytes: event.payload_bytes,
+            rtt_us:        event.rtt_us,
+            timestamp_ns:  event.timestamp_ns,
         })
         .context("Failed to serialize NetworkEvent to JSON")?;
 
         self.producer
             .send(
                 FutureRecord::to(&self.topic)
+                    .key(&key)
+                    .payload(&payload),
+                Duration::from_secs(5),
+            )
+            .await
+            .map_err(|(err, _msg)| anyhow::anyhow!("Kafka send failed: {err}"))?;
+
+        Ok(())
+    }
+
+    /// Serialize and send a `RetransmitEvent` to the retransmit Kafka topic.
+    pub async fn send_retransmit(&self, event: &RetransmitEvent) -> Result<()> {
+        let src_ip = Ipv4Addr::from(event.src_addr).to_string();
+        let dst_ip = Ipv4Addr::from(event.dst_addr).to_string();
+
+        let key = format!("{}:{}->{}", src_ip, event.src_port, dst_ip);
+
+        #[derive(Serialize)]
+        struct RetransmitPayload<'a> {
+            src_ip:            &'a str,
+            src_port:          u16,
+            dst_ip:            &'a str,
+            dst_port:          u16,
+            rto_us:            u32,
+            retransmit_count:  u32,
+            timestamp_ns:      u64,
+        }
+
+        let payload = serde_json::to_string(&RetransmitPayload {
+            src_ip:           &src_ip,
+            src_port:         event.src_port,
+            dst_ip:           &dst_ip,
+            dst_port:         event.dst_port,
+            rto_us:           event.rto_us,
+            retransmit_count: event.retransmit_count,
+            timestamp_ns:     event.timestamp_ns,
+        })
+        .context("Failed to serialize RetransmitEvent to JSON")?;
+
+        self.producer
+            .send(
+                FutureRecord::to(&self.retransmit_topic)
                     .key(&key)
                     .payload(&payload),
                 Duration::from_secs(5),
