@@ -1,0 +1,9 @@
+[package]
+name    = "monitor-common"
+version = "0.1.0"
+edition = "2021"
+
+# Shared event types used by the monitor binary and (optionally) any
+# downstream consumers. No longer needs no_std — pcap runs in userspace.
+
+[dependencies]
