@@ -1,3 +1,7 @@
-/target
 .DS_Store
-build/
+monitor-go/monitor
+
+# CDK
+node_modules/
+infra/cdk.out/
+infra/dist/
